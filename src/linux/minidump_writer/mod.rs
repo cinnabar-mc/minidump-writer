@@ -751,42 +751,24 @@ impl MinidumpWriter {
     // not in case of stack overflows, hence the returned pointer might be
     // different from the one that was passed in.
     pub fn get_stack_info(&self, int_stack_pointer: usize) -> Result<(usize, usize), WriterError> {
-        // Round the stack pointer to the nearest page, this will cause us to
-        // capture data below the stack pointer which might still be relevant.
-        let mut stack_pointer = int_stack_pointer & !(self.page_size - 1);
-        let mut mapping = self.find_mapping(stack_pointer);
-
-        // The guard page has been 1 MiB in size since kernel 4.12, older
-        // kernels used a 4 KiB one instead. Note the saturating add, as 32-bit
-        // processes can have a stack pointer within 1MiB of usize::MAX
-        let guard_page_max_addr = stack_pointer.saturating_add(1024 * 1024);
-
-        // If we found no mapping, or the mapping we found has no permissions
-        // then we might have hit a guard page, try looking for a mapping in
-        // addresses past the stack pointer. Stack grows towards lower addresses
-        // on the platforms we care about so the stack should appear after the
-        // guard page.
-        while !Self::may_be_stack(mapping) && (stack_pointer <= guard_page_max_addr) {
-            let Some(next_page) = stack_pointer.checked_add(self.page_size) else {
+        // Mapping permissions do not expose guards installed with MADV_GUARD_INSTALL.
+        // Probe each page before accepting it as the start of a readable stack.
+        let mut address = int_stack_pointer & !(self.page_size - 1);
+        let guard_end = address.saturating_add(1024 * 1024);
+        let memory = self.process_inspector.process_reader();
+        while address <= guard_end {
+            if let Some(mapping) = self.find_mapping(address)
+                && Self::may_be_stack(Some(mapping))
+                && matches!(memory.read(address, &mut [0u8]), Ok(1))
+            {
+                return Ok((address, mapping.size - (address - mapping.start_address)));
+            }
+            let Some(next_page) = address.checked_add(self.page_size) else {
                 break;
             };
-            stack_pointer = next_page;
-            mapping = self.find_mapping(stack_pointer);
+            address = next_page;
         }
-
-        mapping
-            .filter(|mapping| Self::may_be_stack(Some(mapping)))
-            .map(|mapping| {
-                let valid_stack_pointer = if mapping.contains_address(stack_pointer) {
-                    stack_pointer
-                } else {
-                    mapping.start_address
-                };
-
-                let stack_len = mapping.size - (valid_stack_pointer - mapping.start_address);
-                (valid_stack_pointer, stack_len)
-            })
-            .ok_or(WriterError::NoStackPointerMapping)
+        Err(WriterError::NoStackPointerMapping)
     }
 
     fn may_be_stack(mapping: Option<&MappingInfo>) -> bool {

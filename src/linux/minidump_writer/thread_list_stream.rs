@@ -34,6 +34,8 @@ pub enum SectionThreadListError {
     ),
     #[error("Failed to copy memory from process")]
     CopyFromProcessError(#[source] CopyFromProcessError),
+    #[error("Failed to locate readable stack memory")]
+    GetStackInfoFailed(#[source] Box<WriterError>),
     #[error("Failed to read stack for thread {thread_id}")]
     StackReadFailed {
         thread_id: u32,
@@ -228,59 +230,82 @@ impl MinidumpWriter {
         thread.stack.memory.data_size = 0;
         thread.stack.memory.rva = buffer.position() as u32;
 
-        if let Ok((valid_stack_ptr, stack_len)) = self.get_stack_info(stack_ptr) {
-            let stack_len = if let MaxStackLen::Len(max_stack_len) = max_stack_len {
-                min(stack_len, max_stack_len)
+        let (valid_stack_ptr, stack_len) = match self.get_stack_info(stack_ptr) {
+            Ok(stack) => stack,
+            Err(error) => {
+                soft_errors.push(SectionThreadListError::GetStackInfoFailed(Box::new(error)));
+                return Ok(());
+            }
+        };
+        let stack_len = if let MaxStackLen::Len(max_stack_len) = max_stack_len {
+            min(stack_len, max_stack_len)
+        } else {
+            stack_len
+        };
+
+        let mut stack_bytes = match self.copy_stack(valid_stack_ptr, stack_len) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                soft_errors.push(SectionThreadListError::StackReadFailed {
+                    thread_id: thread.thread_id,
+                    error,
+                });
+                return Ok(());
+            }
+        };
+        let stack_pointer_offset = stack_ptr.saturating_sub(valid_stack_ptr);
+        if self.skip_stacks_if_mapping_unreferenced {
+            if let Some(principal_mapping) = &self.principal_mapping {
+                let low_addr = principal_mapping.system_mapping_info.start_address;
+                let high_addr = principal_mapping.system_mapping_info.end_address;
+                if (instruction_ptr < low_addr || instruction_ptr > high_addr)
+                    && !principal_mapping
+                        .stack_has_pointer_to_mapping(&stack_bytes, stack_pointer_offset)
+                {
+                    return Ok(());
+                }
             } else {
-                stack_len
-            };
-
-            let mut stack_bytes = match self.copy_stack(valid_stack_ptr, stack_len) {
-                Ok(bytes) if !bytes.is_empty() => bytes,
-                Ok(_) => return Ok(()),
-                Err(error) => {
-                    soft_errors.push(SectionThreadListError::StackReadFailed {
-                        thread_id: thread.thread_id,
-                        error,
-                    });
-                    return Ok(());
-                }
-            };
-            let stack_pointer_offset = stack_ptr.saturating_sub(valid_stack_ptr);
-            if self.skip_stacks_if_mapping_unreferenced {
-                if let Some(principal_mapping) = &self.principal_mapping {
-                    let low_addr = principal_mapping.system_mapping_info.start_address;
-                    let high_addr = principal_mapping.system_mapping_info.end_address;
-                    if (instruction_ptr < low_addr || instruction_ptr > high_addr)
-                        && !principal_mapping
-                            .stack_has_pointer_to_mapping(&stack_bytes, stack_pointer_offset)
-                    {
-                        return Ok(());
-                    }
-                } else {
-                    return Ok(());
-                }
+                return Ok(());
             }
-
-            if self.sanitize_stack {
-                self.sanitize_stack_copy(&mut stack_bytes, stack_ptr, stack_pointer_offset)
-                    .map_err(|e| SectionThreadListError::SanitizeStackCopyFailed(Box::new(e)))?;
-            }
-
-            let stack_location = MDLocationDescriptor {
-                data_size: stack_bytes.len() as u32,
-                rva: buffer.position() as u32,
-            };
-            buffer.write_all(&stack_bytes);
-            thread.stack.start_of_memory_range = valid_stack_ptr as u64;
-            thread.stack.memory = stack_location;
-            self.memory_blocks.push(thread.stack);
         }
+
+        if self.sanitize_stack {
+            self.sanitize_stack_copy(&mut stack_bytes, stack_ptr, stack_pointer_offset)
+                .map_err(|e| SectionThreadListError::SanitizeStackCopyFailed(Box::new(e)))?;
+        }
+
+        let stack_location = MemoryArrayWriter::alloc_from_array(buffer, &stack_bytes)?.location();
+        thread.stack.start_of_memory_range = valid_stack_ptr as u64;
+        thread.stack.memory = stack_location;
+        self.memory_blocks.push(thread.stack);
         Ok(())
     }
 
-    /// Retries stack reads that a previously selected memory backend cannot satisfy.
+    /// Copies a readable stack prefix, stopping at the first inaccessible page.
     fn copy_stack(&self, start: usize, len: usize) -> Result<Vec<u8>, CopyFromProcessError> {
+        let mut output = Vec::with_capacity(len);
+        while output.len() < len {
+            let address = start + output.len();
+            let chunk = (len - output.len()).min(self.page_size - address % self.page_size);
+            match self.copy_stack_chunk(address, chunk) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    let short = bytes.len() < chunk;
+                    output.extend_from_slice(&bytes);
+                    if short {
+                        break;
+                    }
+                }
+                Ok(_) => break,
+                Err(error) if output.is_empty() => return Err(error),
+                Err(_) => break,
+            }
+        }
+        Ok(output)
+    }
+
+    /// Reads one stack page with fallback backends after a cached reader fails.
+    fn copy_stack_chunk(&self, start: usize, len: usize) -> Result<Vec<u8>, CopyFromProcessError> {
         use super::super::process_inspection::process_reader::ProcessReader;
 
         let len = std::num::NonZeroUsize::new(len).ok_or(CopyFromProcessError::InvalidArgument)?;
@@ -397,18 +422,14 @@ mod tests {
     fn stack_read_keeps_a_readable_prefix() {
         // SAFETY: sysconf has no pointer arguments and returns the system page size.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let mut mapping = memmap2::MmapOptions::new()
-            .len(2 * page)
-            .map_anon()
-            .unwrap();
-        mapping.fill(0x5a);
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(page as u64).unwrap();
+        // SAFETY: Only the first, file-backed page is accessed directly.
+        let mut mapping =
+            unsafe { memmap2::MmapOptions::new().len(2 * page).map_mut(&file) }.unwrap();
+        mapping[..page].fill(0x5a);
         let start = mapping.as_ptr() as usize;
         let mut writer = stack_writer(start, mapping.len(), MMPermissions::READ);
-        // SAFETY: The second page belongs to this mapping and is not accessed directly again.
-        assert_eq!(
-            unsafe { libc::mprotect(mapping.as_mut_ptr().add(page).cast(), page, libc::PROT_NONE) },
-            0
-        );
         let mut buffer = DumpBuf::with_capacity(0);
         let mut thread = empty_thread();
         writer
@@ -424,5 +445,53 @@ mod tests {
         assert_eq!(thread.stack.start_of_memory_range, start as u64);
         assert_eq!(thread.stack.memory.data_size as usize, page);
         assert_eq!(writer.memory_blocks.len(), 1);
+    }
+
+    #[test]
+    fn stack_reads_skip_lightweight_guards_and_stop_at_the_next_guard() {
+        // Linux's guard advice is not exposed by libc yet.
+        const MADV_GUARD_INSTALL: libc::c_int = 102;
+        // SAFETY: sysconf has no pointer arguments and returns the system page size.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let mut mapping = memmap2::MmapOptions::new()
+            .len(5 * page)
+            .map_anon()
+            .unwrap();
+        mapping.fill(0x5a);
+        let start = mapping.as_ptr() as usize;
+        // SAFETY: The guard covers the first page of our anonymous mapping.
+        if unsafe { libc::madvise(mapping.as_mut_ptr().cast(), page, MADV_GUARD_INSTALL) } != 0 {
+            eprintln!("SKIP: kernel fixture MADV_GUARD_INSTALL is unavailable");
+            return;
+        }
+        // SAFETY: Installs the second guard on the third page, never accessed directly again.
+        assert_eq!(
+            unsafe {
+                libc::madvise(
+                    mapping.as_mut_ptr().add(2 * page).cast(),
+                    page,
+                    MADV_GUARD_INSTALL,
+                )
+            },
+            0
+        );
+        let writer = stack_writer(
+            start,
+            mapping.len(),
+            MMPermissions::READ | MMPermissions::WRITE,
+        );
+        assert!(
+            MappingInfo::for_pid(&writer.process_inspector, writer.process_id, None)
+                .unwrap()
+                .iter()
+                .any(|mapping| mapping.contains_address(start)
+                    && mapping
+                        .permissions
+                        .contains(MMPermissions::READ | MMPermissions::WRITE))
+        );
+        assert!(MinidumpWriter::copy_from_process(&writer.process_inspector, start, 1).is_err());
+        let (stack, len) = writer.get_stack_info(start + page / 2).unwrap();
+        assert_eq!(stack, start + page);
+        assert_eq!(writer.copy_stack(stack, len).unwrap(), vec![0x5a; page]);
     }
 }
