@@ -34,6 +34,12 @@ pub enum SectionThreadListError {
     ),
     #[error("Failed to copy memory from process")]
     CopyFromProcessError(#[source] CopyFromProcessError),
+    #[error("Failed to read stack for thread {thread_id}")]
+    StackReadFailed {
+        thread_id: u32,
+        #[source]
+        error: CopyFromProcessError,
+    },
     #[error("Failed to get thread info")]
     ThreadInfoError(#[from] ThreadInfoError),
     #[error("Failed to write to memory buffer")]
@@ -50,6 +56,15 @@ impl MinidumpWriter {
     pub fn write_thread_list_stream(
         &mut self,
         buffer: &mut DumpBuf,
+    ) -> Result<MDRawDirectory, SectionThreadListError> {
+        self.write_thread_list_stream_with_errors(buffer, error_graph::strategy::DontCare)
+    }
+
+    /// Writes thread contexts and records unreadable stacks as non-fatal errors.
+    pub(super) fn write_thread_list_stream_with_errors(
+        &mut self,
+        buffer: &mut DumpBuf,
+        mut soft_errors: impl WriteErrorList<SectionThreadListError>,
     ) -> Result<MDRawDirectory, SectionThreadListError> {
         let num_threads = self.threads.len();
         // Memory looks like this:
@@ -107,6 +122,7 @@ impl MinidumpWriter {
                     instruction_ptr,
                     stack_pointer,
                     MaxStackLen::None,
+                    &mut soft_errors,
                 )?;
                 // Copy 256 bytes around crashing instruction pointer to minidump.
                 let ip_memory_size: usize = 256;
@@ -136,12 +152,17 @@ impl MinidumpWriter {
                     ip_memory_d.memory.data_size =
                         (end_of_range - ip_memory_d.start_of_memory_range) as u32;
 
-                    let memory_copy = MinidumpWriter::copy_from_process(
+                    let memory_copy = match MinidumpWriter::copy_from_process(
                         &self.process_inspector,
                         ip_memory_d.start_of_memory_range as _,
                         ip_memory_d.memory.data_size as usize,
-                    )
-                    .map_err(SectionThreadListError::CopyFromProcessError)?;
+                    ) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            soft_errors.push(SectionThreadListError::CopyFromProcessError(error));
+                            break;
+                        }
+                    };
 
                     let mem_section = MemoryArrayWriter::alloc_from_array(buffer, &memory_copy)?;
                     ip_memory_d.memory = mem_section.location();
@@ -172,6 +193,7 @@ impl MinidumpWriter {
                     instruction_ptr,
                     info.stack_pointer,
                     max_stack_len,
+                    &mut soft_errors,
                 )?;
 
                 let mut cpu = RawContextCPU::default();
@@ -192,6 +214,7 @@ impl MinidumpWriter {
         Ok(dirent)
     }
 
+    /// Copies the available stack, leaving an empty descriptor if every reader fails.
     fn fill_thread_stack(
         &mut self,
         buffer: &mut DumpBuf,
@@ -199,6 +222,7 @@ impl MinidumpWriter {
         instruction_ptr: usize,
         stack_ptr: usize,
         max_stack_len: MaxStackLen,
+        mut soft_errors: impl WriteErrorList<SectionThreadListError>,
     ) -> Result<(), SectionThreadListError> {
         thread.stack.start_of_memory_range = stack_ptr.try_into()?;
         thread.stack.memory.data_size = 0;
@@ -211,12 +235,17 @@ impl MinidumpWriter {
                 stack_len
             };
 
-            let mut stack_bytes = MinidumpWriter::copy_from_process(
-                &self.process_inspector,
-                valid_stack_ptr,
-                stack_len,
-            )
-            .map_err(SectionThreadListError::CopyFromProcessError)?;
+            let mut stack_bytes = match self.copy_stack(valid_stack_ptr, stack_len) {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    soft_errors.push(SectionThreadListError::StackReadFailed {
+                        thread_id: thread.thread_id,
+                        error,
+                    });
+                    return Ok(());
+                }
+            };
             let stack_pointer_offset = stack_ptr.saturating_sub(valid_stack_ptr);
             if self.skip_stacks_if_mapping_unreferenced {
                 if let Some(principal_mapping) = &self.principal_mapping {
@@ -248,5 +277,152 @@ impl MinidumpWriter {
             self.memory_blocks.push(thread.stack);
         }
         Ok(())
+    }
+
+    /// Retries stack reads that a previously selected memory backend cannot satisfy.
+    fn copy_stack(&self, start: usize, len: usize) -> Result<Vec<u8>, CopyFromProcessError> {
+        use super::super::process_inspection::process_reader::ProcessReader;
+
+        let len = std::num::NonZeroUsize::new(len).ok_or(CopyFromProcessError::InvalidArgument)?;
+        self.process_inspector
+            .process_reader()
+            .read_to_vec(start, len)
+            .or_else(|_| {
+                ProcessReader::for_file(&self.process_inspector)
+                    .map_err(CopyFromProcessError::Backend)?
+                    .read_to_vec(start, len)
+            })
+            .or_else(|_| ProcessReader::for_ptrace(&self.process_inspector).read_to_vec(start, len))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::linux::maps_reader::SystemMappingInfo;
+
+    /// Builds an unsuspended writer for testing reads from this process only.
+    fn stack_writer(start: usize, len: usize, permissions: MMPermissions) -> MinidumpWriter {
+        let pid = std::process::id() as Pid;
+        let mut writer = MinidumpWriterConfig::new(pid, pid).build();
+        // SAFETY: sysconf has no pointer arguments and returns the system page size.
+        writer.page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        writer.mappings.push(MappingInfo {
+            start_address: start,
+            size: len,
+            system_mapping_info: SystemMappingInfo {
+                start_address: start,
+                end_address: start + len,
+            },
+            offset: 0,
+            permissions,
+            name: None,
+        });
+        writer
+    }
+
+    /// Creates an empty thread descriptor before filling its stack.
+    fn empty_thread() -> MDRawThread {
+        MDRawThread {
+            thread_id: 0,
+            suspend_count: 0,
+            priority_class: 0,
+            priority: 0,
+            teb: 0,
+            stack: MDMemoryDescriptor::default(),
+            thread_context: MDLocationDescriptor::default(),
+        }
+    }
+
+    #[test]
+    fn stack_guard_search_does_not_return_an_unreadable_mapping() {
+        let writer = stack_writer(0x1000, 2 * 1024 * 1024, MMPermissions::PRIVATE);
+        assert!(writer.get_stack_info(0x1000).is_err());
+    }
+
+    #[test]
+    fn stack_guard_search_at_address_limit_does_not_overflow() {
+        let start = usize::MAX & !4095;
+        let writer = stack_writer(start, usize::MAX - start, MMPermissions::PRIVATE);
+        assert!(writer.get_stack_info(start).is_err());
+    }
+
+    #[test]
+    fn stack_read_failure_keeps_an_empty_descriptor() {
+        // An empty file can be mapped, but reading beyond EOF fails through every backend.
+        let file = tempfile::tempfile().unwrap();
+        // SAFETY: The mapping is never dereferenced; only process-memory readers access it.
+        let mapping = unsafe { memmap2::MmapOptions::new().len(4096).map_mut(&file) }.unwrap();
+        let start = mapping.as_ptr() as usize;
+        let mut writer = stack_writer(start, mapping.len(), MMPermissions::READ);
+        let mut buffer = DumpBuf::with_capacity(0);
+        let mut thread = empty_thread();
+        let mut errors = ErrorList::default();
+        writer
+            .fill_thread_stack(
+                &mut buffer,
+                &mut thread,
+                0,
+                start,
+                MaxStackLen::None,
+                &mut errors,
+            )
+            .expect("an unreadable stack must not abort the thread list");
+        assert_eq!(thread.stack.start_of_memory_range, start as u64);
+        assert_eq!(thread.stack.memory.data_size, 0);
+        assert!(writer.memory_blocks.is_empty());
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn stack_read_retries_a_cached_virtual_memory_backend() {
+        let mut mapping = memmap2::MmapOptions::new().len(4096).map_anon().unwrap();
+        mapping.fill(0x5a);
+        let start = mapping.as_ptr() as usize;
+        let writer = stack_writer(start, mapping.len(), MMPermissions::READ);
+        // The reader has already selected process_vm_readv when the stack read fails.
+        assert_eq!(writer.copy_stack(start, 1).unwrap(), [0x5a]);
+        // SAFETY: This mapping is not accessed directly after its protection changes.
+        assert_eq!(
+            unsafe { libc::mprotect(mapping.as_mut_ptr().cast(), mapping.len(), libc::PROT_NONE) },
+            0
+        );
+        assert_eq!(
+            writer.copy_stack(start, mapping.len()).unwrap(),
+            vec![0x5a; mapping.len()]
+        );
+    }
+
+    #[test]
+    fn stack_read_keeps_a_readable_prefix() {
+        // SAFETY: sysconf has no pointer arguments and returns the system page size.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let mut mapping = memmap2::MmapOptions::new()
+            .len(2 * page)
+            .map_anon()
+            .unwrap();
+        mapping.fill(0x5a);
+        let start = mapping.as_ptr() as usize;
+        let mut writer = stack_writer(start, mapping.len(), MMPermissions::READ);
+        // SAFETY: The second page belongs to this mapping and is not accessed directly again.
+        assert_eq!(
+            unsafe { libc::mprotect(mapping.as_mut_ptr().add(page).cast(), page, libc::PROT_NONE) },
+            0
+        );
+        let mut buffer = DumpBuf::with_capacity(0);
+        let mut thread = empty_thread();
+        writer
+            .fill_thread_stack(
+                &mut buffer,
+                &mut thread,
+                0,
+                start,
+                MaxStackLen::None,
+                error_graph::strategy::DontCare,
+            )
+            .unwrap();
+        assert_eq!(thread.stack.start_of_memory_range, start as u64);
+        assert_eq!(thread.stack.memory.data_size as usize, page);
+        assert_eq!(writer.memory_blocks.len(), 1);
     }
 }

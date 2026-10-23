@@ -351,6 +351,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crash-context"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3748e166981fa3ba9dc54ff950ad0ed5ca4aab4b73eae21d9f539659fe806e28"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "mach2",
+]
+
+[[package]]
 name = "crc"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1360,7 +1371,7 @@ dependencies = [
  "bitflags 2.13.1",
  "byteorder",
  "cfg-if",
- "crash-context",
+ "crash-context 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "current_platform",
  "dump_syms",
  "error-graph",
@@ -1374,7 +1385,7 @@ dependencies = [
  "minidump",
  "minidump-common",
  "minidump-unwind",
- "process-backend",
+ "process-backend 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "procfs-core 0.18.0",
  "scroll 0.12.0",
  "serde",
@@ -1665,7 +1676,20 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "log",
- "process-reader",
+ "process-reader 0.1.0",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "process-backend"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07c02e259a3522eccc4957ee6e922db4945648fb7730a41192d919518d06a530"
+dependencies = [
+ "libc",
+ "log",
+ "process-reader 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "thiserror 2.0.19",
 ]
@@ -1673,6 +1697,16 @@ dependencies = [
 [[package]]
 name = "process-reader"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+]
+
+[[package]]
+name = "process-reader"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3024e1803f4b8c40cca8c1955243410354cb4d67f053af9210147416a7265535"
 dependencies = [
  "libc",
  "serde",

@@ -345,7 +345,10 @@ impl MinidumpWriter {
         // we should have a mostly-intact dump
         dir_section.write_to_file(buffer, None)?;
 
-        let dirent = self.write_thread_list_stream(buffer)?;
+        let dirent = self.write_thread_list_stream_with_errors(
+            buffer,
+            soft_errors.subwriter(WriterError::WriteThreadListErrors),
+        )?;
         dir_section.write_to_file(buffer, Some(dirent))?;
 
         let dirent = self.write_mappings(buffer)?;
@@ -764,11 +767,15 @@ impl MinidumpWriter {
         // on the platforms we care about so the stack should appear after the
         // guard page.
         while !Self::may_be_stack(mapping) && (stack_pointer <= guard_page_max_addr) {
-            stack_pointer += self.page_size;
+            let Some(next_page) = stack_pointer.checked_add(self.page_size) else {
+                break;
+            };
+            stack_pointer = next_page;
             mapping = self.find_mapping(stack_pointer);
         }
 
         mapping
+            .filter(|mapping| Self::may_be_stack(Some(mapping)))
             .map(|mapping| {
                 let valid_stack_pointer = if mapping.contains_address(stack_pointer) {
                     stack_pointer
